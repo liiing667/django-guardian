@@ -6,6 +6,7 @@ import django
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.db.models import IntegerField, Value
 from django.db.models.query import QuerySet
 from django.test import TestCase, TransactionTestCase
@@ -38,10 +39,13 @@ from guardian.shortcuts import (
 from guardian.testapp.models import (
     CharPKModel,
     ChildTestModel,
+    Post,
+    Project,
     TextPKModel,
     UUIDPKModel,
 )
 from guardian.testapp.tests.test_core import ObjectPermissionTestCase
+from guardian.utils import get_group_obj_perms_model, get_user_obj_perms_model
 
 User = get_user_model()
 user_app_label = User._meta.app_label
@@ -425,6 +429,95 @@ class RemovePermTest(ObjectPermissionTestCase):
         assign_perm("contenttypes.contenttype.reorder", self.user, self.ctype)
         remove_perm("contenttypes.contenttype.reorder", self.user, self.ctype)
         self.assertFalse(self.user.has_perm("contenttypes.contenttype.reorder", self.ctype))
+
+
+class BulkMixedContentTypeTest(TestCase):
+    """Bulk assign/remove must reject batches mixing different models.
+
+    Previously the content type was taken from the first object only, so a
+    queryset-like list combining two models wrote every row against one content
+    type and colliding primary keys produced permissions for the wrong object.
+    These tests pin the atomic-failure, zero-side-effect contract using two
+    testapp models with the same primary keys.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="mixed-bulk-user")
+        self.group = Group.objects.create(name="mixed-bulk-group")
+        self.post = Post.objects.create(title="post", pk=300)
+        self.other_post = Post.objects.create(title="other-post", pk=301)
+        self.project = Project.objects.create(name="project", pk=300)
+        self.user_perm_model = get_user_obj_perms_model(self.post)
+        self.group_perm_model = get_group_obj_perms_model(self.post)
+
+    def test_assign_perm_mixed_user_batch_fails_atomically(self):
+        with self.assertRaises(MixedContentTypeError), transaction.atomic():
+            assign_perm("change_post", self.user, [self.post, self.project])
+        self.assertEqual(self.user_perm_model.objects.count(), 0)
+        self.assertFalse(self.user.has_perm("change_post", self.post))
+        self.assertFalse(self.user.has_perm("change_project", self.project))
+
+    def test_assign_perm_mixed_group_batch_fails_atomically(self):
+        with self.assertRaises(MixedContentTypeError), transaction.atomic():
+            assign_perm("change_post", self.group, [self.post, self.project])
+        self.assertEqual(self.group_perm_model.objects.count(), 0)
+
+    def test_assign_perm_heterotypic_object_later_in_batch_fails(self):
+        with self.assertRaises(MixedContentTypeError):
+            assign_perm("change_post", self.user, [self.post, self.other_post, self.project])
+        self.assertEqual(self.user_perm_model.objects.count(), 0)
+
+    def test_assign_perm_same_pk_distinct_instances_conflicts(self):
+        fetched_post = Post.objects.get(pk=self.post.pk)
+        self.assertIsNot(fetched_post, self.post)
+        with self.assertRaises(MixedContentTypeError):
+            assign_perm("change_post", self.user, [self.post, fetched_post])
+        self.assertEqual(self.user_perm_model.objects.count(), 0)
+
+    def test_assign_perm_repeated_instance_is_deduped(self):
+        assigned = assign_perm("change_post", self.user, [self.post, self.post])
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(self.user_perm_model.objects.count(), 1)
+        self.assertTrue(self.user.has_perm("change_post", self.post))
+
+    def test_remove_perm_mixed_batch_fails_without_side_effects(self):
+        assign_perm("change_post", self.user, [self.post, self.other_post])
+        self.assertEqual(self.user_perm_model.objects.count(), 2)
+
+        with self.assertRaises(MixedContentTypeError), transaction.atomic():
+            remove_perm("change_post", self.user, [self.post, self.project])
+        self.assertEqual(self.user_perm_model.objects.count(), 2)
+
+    def test_remove_perm_mixed_group_batch_fails_without_side_effects(self):
+        assign_perm("change_post", self.group, [self.post, self.other_post])
+        self.assertEqual(self.group_perm_model.objects.count(), 2)
+
+        with self.assertRaises(MixedContentTypeError):
+            remove_perm("change_post", self.group, [self.post, self.project])
+        self.assertEqual(self.group_perm_model.objects.count(), 2)
+
+    def test_homogeneous_batch_single_object_and_empty_list_stay_compatible(self):
+        self.assertIsNone(assign_perm("change_post", self.user, []))
+        self.assertIsNone(remove_perm("change_post", self.user, []))
+
+        assign_perm("change_post", self.user, [self.post, self.other_post])
+        self.assertTrue(self.user.has_perm("change_post", self.post))
+        self.assertTrue(self.user.has_perm("change_post", self.other_post))
+
+        assign_perm("change_project", self.user, self.project)
+        self.assertTrue(self.user.has_perm("change_project", self.project))
+
+        remove_perm("change_post", self.user, [self.post, self.other_post])
+        self.assertFalse(self.user.has_perm("change_post", self.post))
+        self.assertFalse(self.user.has_perm("change_post", self.other_post))
+        remove_perm("change_project", self.user, self.project)
+        self.assertFalse(self.user.has_perm("change_project", self.project))
+
+    def test_homogeneous_queryset_bulk_stays_compatible(self):
+        assign_perm("change_post", self.user, Post.objects.all())
+        self.assertEqual(self.user_perm_model.objects.count(), 2)
+        remove_perm("change_post", self.user, Post.objects.all())
+        self.assertEqual(self.user_perm_model.objects.count(), 0)
 
 
 class MultipleIdentitiesRemoveTest(ObjectPermissionTestCase):

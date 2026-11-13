@@ -10,11 +10,69 @@ from django.db.models import Model, Q, QuerySet
 from guardian.conf import settings as guardian_settings
 from guardian.core import ObjectPermissionChecker
 from guardian.ctypes import get_content_type, get_default_content_type
-from guardian.exceptions import ObjectNotPersisted
+from guardian.exceptions import MixedContentTypeError, ObjectNotPersisted
 
 _PermType: TypeAlias = Permission | str
 
 _DEFAULT_CONTENT_TYPE_PATH = f"{get_default_content_type.__module__}.{get_default_content_type.__name__}"
+
+
+def _validate_homogeneous_objects(objects: QuerySet | list) -> tuple[QuerySet | list, type[Model]]:
+    """Ensures a bulk target contains objects of a single model.
+
+    Lists are materialized and validated eagerly, so a heterotypic object that
+    only appears while the list is being consumed is rejected before any
+    permission row is written.
+    """
+    if isinstance(objects, QuerySet):
+        return objects, objects.model
+
+    objects = list(objects)
+    if not objects:
+        return objects, None  # type: ignore[return-value]
+
+    model = type(objects[0])
+    for instance in objects[1:]:
+        if type(instance) is not model:
+            raise MixedContentTypeError(
+                "Bulk object permission operations require every object to share the same model, "
+                f"but got {model._meta.label} and {type(instance)._meta.label}."
+            )
+    return objects, model
+
+
+def _dedupe_objects(objects: list[Model]) -> list[Model]:
+    """Removes repeated references to the same object instance.
+
+    Distinct instances sharing one primary key are kept apart by
+    ``_validate_unique_pks``, so plain list repetition stays safe to collapse.
+    """
+    unique_objects = []
+    seen_ids = set()
+    for instance in objects:
+        instance_id = id(instance)
+        if instance_id in seen_ids:
+            continue
+        seen_ids.add(instance_id)
+        unique_objects.append(instance)
+    return unique_objects
+
+
+def _validate_unique_pks(objects: list[Model]) -> None:
+    """Rejects distinct instances that resolve to the same database row.
+
+    Two different in-memory instances with the same pk would produce duplicate
+    permission rows or delete one another's permissions, so such a batch is
+    rejected before any write takes place.
+    """
+    seen_pks = set()
+    for instance in objects:
+        if instance.pk in seen_pks:
+            raise MixedContentTypeError(
+                "Bulk object permission operations received distinct instances of "
+                f"{type(instance)._meta.label} with the same primary key ({instance.pk!r})."
+            )
+        seen_pks.add(instance.pk)
 
 
 def _is_using_default_content_type() -> bool:
@@ -93,19 +151,21 @@ class BaseObjectPermissionManager(models.Manager):
         Bulk assigns permissions with given `perm` for an objects in `queryset` and
         `user_or_group`.
         """
-        if isinstance(queryset, list):
-            if not queryset:
+        objects, model = _validate_homogeneous_objects(queryset)
+        if isinstance(objects, list):
+            if not objects:
                 return []
-            ctype = get_content_type(queryset[0])
-        else:
-            ctype = get_content_type(queryset.model)
+            objects = _dedupe_objects(objects)
+            _validate_unique_pks(objects)
+
+        ctype = get_content_type(model)
 
         permission = _ensure_permission(perm, ctype)
         checker = ObjectPermissionChecker(user_or_group)
-        checker.prefetch_perms(queryset)
+        checker.prefetch_perms(objects)
 
         assigned_perms = []
-        for instance in queryset:
+        for instance in objects:
             if not checker.has_perm(permission.codename, instance):
                 kwargs = {"permission": permission, self.user_or_group_field: user_or_group}
                 if self.is_generic():
@@ -175,23 +235,24 @@ class BaseObjectPermissionManager(models.Manager):
         Uses `QuerySet.delete()`, which sends `pre_delete` and `post_delete`
         signals but does not call each object-permission instance's `delete()` method.
         """
-        filters = Q(**{self.user_or_group_field: user_or_group})
-
-        if isinstance(queryset, list):
-            if not queryset:
+        objects, model = _validate_homogeneous_objects(queryset)
+        if isinstance(objects, list):
+            if not objects:
                 return (0, {})
-            ctype = get_content_type(queryset[0])
-        else:
-            ctype = get_content_type(queryset.model)
+            objects = _dedupe_objects(objects)
+            _validate_unique_pks(objects)
 
+        ctype = get_content_type(model)
+
+        filters = Q(**{self.user_or_group_field: user_or_group})
         filters &= _get_perm_filter(perm, ctype=ctype)
         if self.is_generic():
-            if isinstance(queryset, list):
-                filters &= Q(object_pk__in=[str(obj.pk) for obj in queryset])
+            if isinstance(objects, list):
+                filters &= Q(object_pk__in=[str(obj.pk) for obj in objects])
             else:
-                filters &= Q(object_pk__in=[str(pk) for pk in queryset.values_list("pk", flat=True)])
+                filters &= Q(object_pk__in=[str(pk) for pk in objects.values_list("pk", flat=True)])
         else:
-            filters &= Q(content_object__in=queryset)
+            filters &= Q(content_object__in=objects)
 
         return self.filter(filters).delete()
 

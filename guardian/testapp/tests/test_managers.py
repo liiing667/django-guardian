@@ -6,6 +6,7 @@ from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
 
+from guardian.exceptions import MixedContentTypeError
 from guardian.managers import (
     GroupObjectPermissionManager,
     UserObjectPermissionManager,
@@ -17,7 +18,7 @@ from guardian.models import (
 from guardian.models import (
     UserObjectPermission as DefaultUserObjectPermission,
 )
-from guardian.testapp.models import ChildTestModel, ParentTestModel
+from guardian.testapp.models import ChildTestModel, ParentTestModel, Post, Project
 from guardian.utils import get_group_obj_perms_model, get_user_obj_perms_model
 
 User = get_user_model()
@@ -124,6 +125,93 @@ class TestManagerAssignPerm(TestCase):
         with self.assertNumQueries(1):
             assigned = GroupObjectPermission.objects.assign_perm_to_many(self.permission, [self.group], self.obj)
         self.assertEqual(assigned, [GroupObjectPermission.objects.get(group=self.group, permission=self.permission)])
+
+
+class TestBulkMixedContentType(TestCase):
+    """Regression tests for mixed-model batches being written to one content type.
+
+    A list combining instances of different models used to inherit the content
+    type of the first object, so colliding primary keys granted permissions on
+    the wrong object. Such batches must now fail atomically with no rows written.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="mixed-user")
+        self.group = Group.objects.create(name="mixed-group")
+        self.post = Post.objects.create(title="post", pk=100)
+        self.other_post = Post.objects.create(title="other-post", pk=101)
+        self.project = Project.objects.create(name="project", pk=100)
+
+    def _assert_no_rows(self, model):
+        self.assertEqual(model.objects.count(), 0)
+
+    def test_user_bulk_assign_rejects_mixed_models(self):
+        model = get_user_obj_perms_model(self.post)
+        with self.assertRaises(MixedContentTypeError):
+            model.objects.bulk_assign_perm("change_post", self.user, [self.post, self.project])
+        self._assert_no_rows(model)
+
+    def test_group_bulk_assign_rejects_mixed_models(self):
+        model = get_group_obj_perms_model(self.post)
+        with self.assertRaises(MixedContentTypeError):
+            model.objects.bulk_assign_perm("change_post", self.group, [self.post, self.project])
+        self._assert_no_rows(model)
+
+    def test_user_bulk_remove_rejects_mixed_models_without_side_effects(self):
+        user_model = get_user_obj_perms_model(self.post)
+        user_model.objects.bulk_assign_perm("change_post", self.user, [self.post, self.other_post])
+        self.assertEqual(user_model.objects.count(), 2)
+
+        with self.assertRaises(MixedContentTypeError):
+            user_model.objects.bulk_remove_perm("change_post", self.user, [self.post, self.project])
+        self.assertEqual(user_model.objects.count(), 2)
+
+    def test_group_bulk_remove_rejects_mixed_models_without_side_effects(self):
+        group_model = get_group_obj_perms_model(self.post)
+        group_model.objects.bulk_assign_perm("change_post", self.group, [self.post, self.other_post])
+        self.assertEqual(group_model.objects.count(), 2)
+
+        with self.assertRaises(MixedContentTypeError):
+            group_model.objects.bulk_remove_perm("change_post", self.group, [self.post, self.project])
+        self.assertEqual(group_model.objects.count(), 2)
+
+    def test_heterotypic_object_later_in_batch_fails_before_writes(self):
+        model = get_user_obj_perms_model(self.post)
+        with self.assertRaises(MixedContentTypeError):
+            model.objects.bulk_assign_perm("change_post", self.user, [self.post, self.other_post, self.project])
+        self._assert_no_rows(model)
+
+    def test_distinct_instances_with_same_pk_are_conflicting(self):
+        fetched_post = Post.objects.get(pk=self.post.pk)
+        self.assertIsNot(fetched_post, self.post)
+        model = get_user_obj_perms_model(self.post)
+        with self.assertRaises(MixedContentTypeError):
+            model.objects.bulk_assign_perm("change_post", self.user, [self.post, fetched_post])
+        self._assert_no_rows(model)
+
+    def test_repeated_same_instance_is_deduped(self):
+        model = get_user_obj_perms_model(self.post)
+        assigned = model.objects.bulk_assign_perm("change_post", self.user, [self.post, self.post])
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(model.objects.count(), 1)
+
+    def test_homogeneous_batch_and_empty_list_stay_compatible(self):
+        model = get_user_obj_perms_model(self.post)
+        assigned = model.objects.bulk_assign_perm("change_post", self.user, [self.post, self.other_post])
+        self.assertEqual(len(assigned), 2)
+        self.assertEqual(model.objects.bulk_assign_perm("change_post", self.user, []), [])
+        self.assertEqual(model.objects.bulk_remove_perm("change_post", self.user, []), (0, {}))
+
+        removed = model.objects.bulk_remove_perm("change_post", self.user, [self.post, self.other_post])
+        self.assertEqual(removed[0], 2)
+        self._assert_no_rows(model)
+
+    def test_homogeneous_queryset_bulk_stays_compatible(self):
+        model = get_user_obj_perms_model(self.post)
+        assigned = model.objects.bulk_assign_perm("change_post", self.user, Post.objects.all())
+        self.assertEqual(len(assigned), 2)
+        model.objects.bulk_remove_perm("change_post", self.user, Post.objects.all())
+        self._assert_no_rows(model)
 
 
 class TestAssignPermCustomContentType(TestCase):

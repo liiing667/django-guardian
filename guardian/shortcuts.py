@@ -11,7 +11,7 @@ from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import (
     BigIntegerField,
     CharField,
@@ -36,6 +36,7 @@ from guardian.exceptions import (
     MultipleIdentityAndObjectError,
     WrongAppError,
 )
+from guardian.managers import _validate_homogeneous_objects
 from guardian.utils import (
     get_anonymous_user,
     get_group_obj_perms_model,
@@ -58,6 +59,21 @@ def clear_ct_cache(**kwargs) -> None:
 
 # Allow sorting/grouping by pk by returning first in result tuple
 _get_first = itemgetter(0)
+
+
+def _get_bulk_obj_perms_model(obj: QuerySet | list, getter) -> type[Model]:
+    """Resolves the object-permission model for a homogeneous bulk target.
+
+    Lists are validated up front so a mixed-model batch fails before any
+    permission row is written, instead of silently inheriting the content type
+    of whatever object happens to be first.
+    """
+    if isinstance(obj, list):
+        objects, model = _validate_homogeneous_objects(obj)
+        if not objects:
+            return getter(None)
+        return getter(model)
+    return getter(obj.model)
 
 
 def _ensure_permission(perm: Permission | str) -> Permission:
@@ -154,11 +170,13 @@ def assign_perm(
         if isinstance(user_or_group, (QuerySet, list)):
             raise MultipleIdentityAndObjectError("Only bulk operations on either users/groups OR objects supported")
         if user:
-            model = get_user_obj_perms_model(obj[0] if isinstance(obj, list) else obj.model)
-            return model.objects.bulk_assign_perm(perm, user, obj)
+            model = _get_bulk_obj_perms_model(obj, get_user_obj_perms_model)
+            with transaction.atomic():
+                return model.objects.bulk_assign_perm(perm, user, obj)
         if group:
-            model = get_group_obj_perms_model(obj[0] if isinstance(obj, list) else obj.model)
-            return model.objects.bulk_assign_perm(perm, group, obj)
+            model = _get_bulk_obj_perms_model(obj, get_group_obj_perms_model)
+            with transaction.atomic():
+                return model.objects.bulk_assign_perm(perm, group, obj)
 
     if isinstance(user_or_group, (QuerySet, list)):
         if user:
@@ -229,11 +247,13 @@ def remove_perm(
         if isinstance(user_or_group, (QuerySet, list)):
             raise MultipleIdentityAndObjectError("Only bulk operations on either users/groups OR objects are supported")
         if user:
-            model = get_user_obj_perms_model(obj[0] if isinstance(obj, list) else obj.model)
-            return model.objects.bulk_remove_perm(perm, user, obj)
+            model = _get_bulk_obj_perms_model(obj, get_user_obj_perms_model)
+            with transaction.atomic():
+                return model.objects.bulk_remove_perm(perm, user, obj)
         if group:
-            model = get_group_obj_perms_model(obj[0] if isinstance(obj, list) else obj.model)
-            return model.objects.bulk_remove_perm(perm, group, obj)
+            model = _get_bulk_obj_perms_model(obj, get_group_obj_perms_model)
+            with transaction.atomic():
+                return model.objects.bulk_remove_perm(perm, group, obj)
 
     if isinstance(user_or_group, (QuerySet, list)):
         if user:
